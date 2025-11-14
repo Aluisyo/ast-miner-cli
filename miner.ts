@@ -1,6 +1,7 @@
 import * as readline from "readline";
 import * as os from "os";
 import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
+import { fork, ChildProcess } from "child_process";
 import { randomBytes, createHash } from "crypto";
 import * as bech32 from "bech32";
 import * as fs from "fs";
@@ -380,7 +381,8 @@ function renderGlobalHUD() {
       const parts: string[] = [];
       for (let c = 0; c < cols; c++) {
         const blk = rowBlocks[c] || [];
-        parts.push((blk[lineIdx] ?? ' '.repeat(blockWidth)).padEnd(blockWidth));
+        // Use ANSI-aware padding so visible widths match blockWidth
+        parts.push(ansiPadEnd(blk[lineIdx] ?? '', blockWidth));
       }
       rows.push(parts.join(' '.repeat(gap)));
     }
@@ -679,6 +681,11 @@ async function mineOneContract(
   // Supervisor: spawn workers with restart logic and crash logging
   const compiledWorkerPath = new URL("./dist/miner.js", import.meta.url);
   const useCompiled = fs.existsSync(compiledWorkerPath);
+  const cjsWorkerScript = path.join(process.cwd(), "worker_process.cjs");
+  const jsWorkerScript = path.join(process.cwd(), "worker_process.js");
+  const workerScript = fs.existsSync(cjsWorkerScript)
+    ? cjsWorkerScript
+    : jsWorkerScript;
   const restartCounts = new Array(nWorkers).fill(0);
   const maxRestarts = Number(process.env.WORKER_MAX_RESTARTS || "3");
   const crashLogPath = path.join(process.cwd(), "logs", "worker_crashes.log");
@@ -692,70 +699,113 @@ async function mineOneContract(
     } catch {}
   }
 
+  function terminateWorker(ww: any) {
+    try {
+      if (!ww) return;
+      if (typeof (ww as any).terminate === 'function') {
+        (ww as any).terminate();
+        return;
+      }
+      if (typeof (ww as any).kill === 'function') {
+        try { (ww as any).kill('SIGTERM'); } catch { (ww as any).kill?.(); }
+        return;
+      }
+      if (typeof (ww as any).postMessage === 'function') {
+        try { (ww as any).postMessage({ type: 'stop' }); } catch {}
+        return;
+      }
+    } catch {}
+  }
+
   function spawnWorker(idx: number) {
-    const payload = {
-      seed: Uint8Array.from(seedBuf),
-      header: Uint8Array.from(headerBuf),
-      minerCanon: Uint8Array.from(minerBuf),
-      target: Uint8Array.from(targetBuf),
-      best: bestBuf ? Uint8Array.from(bestBuf) : null,
-      batch: baseBatch,
-      wid: idx,
-    } as unknown as WorkerIn;
+    // If a compiled worker (dist/miner.js) exists we still prefer worker_threads for it,
+    // otherwise fork a separate child process to isolate crashes.
+    if (useCompiled) {
+      const payload = {
+        seed: Uint8Array.from(seedBuf),
+        header: Uint8Array.from(headerBuf),
+        minerCanon: Uint8Array.from(minerBuf),
+        target: Uint8Array.from(targetBuf),
+        best: bestBuf ? Uint8Array.from(bestBuf) : null,
+        batch: baseBatch,
+        wid: idx,
+      } as unknown as WorkerIn;
 
-    const w = useCompiled
-      ? new Worker(compiledWorkerPath, { workerData: payload })
-      : new Worker(new URL(import.meta.url), {
-          execArgv: ["--loader", "ts-node/esm", "--no-warnings"],
-          workerData: payload,
-        });
-
-    if (DEBUG) console.log(`spawned worker ${idx} for contract ${contractIndex} (threads=${nWorkers})`);
-
-    w.on("message", (m: any) => {
-      if (m?.type === "rate") {
-        perWorker[m.wid] = m.hps ?? 0;
-        if (DEBUG) console.debug(`contract ${contractIndex} worker ${m.wid} -> rate ${m.hps} H/s`);
-      } else if (m?.type === "found") {
-        found = { nonce: BigInt(m.nonce), hashHex: m.hashHex };
-        for (const ww of workers) {
-          try {
-            ww.terminate();
-          } catch {}
+      const w = new Worker(compiledWorkerPath, { workerData: payload });
+      if (DEBUG) console.log(`spawned worker_threads worker ${idx} for contract ${contractIndex}`);
+      w.on("message", (m: any) => {
+        if (m?.type === "rate") {
+          perWorker[m.wid] = m.hps ?? 0;
+        } else if (m?.type === "found") {
+          found = { nonce: BigInt(m.nonce), hashHex: m.hashHex };
+          for (const ww of workers) try { terminateWorker(ww); } catch {}
+        } else if (m?.type === "error") {
+          console.error(`worker_threads ${idx} error: ${m.message}`);
         }
-      } else if (m?.type === "error") {
-        console.error(`Worker ${idx} reported error: ${m.message}`);
+      });
+      w.on("error", (err) => console.error(`worker_threads ${idx} error: ${err?.message ?? err}`));
+      w.on("exit", (code: number | null, signal: string | null) => {
+        if (DEBUG) console.debug(`worker_threads ${idx} exit code=${code} signal=${signal}`);
+        const crashed = (code && code !== 0) || (signal && signal !== null);
+        if (crashed) {
+          logCrash({ ts: new Date().toISOString(), contractIndex, worker: idx, code, signal, mode: 'worker_threads' });
+          if (restartCounts[idx] < maxRestarts) {
+            restartCounts[idx]++;
+            if (DEBUG) console.debug(`Restarting worker_threads ${idx}`);
+            spawnWorker(idx);
+          } else console.error(`Worker ${idx} exceeded max restarts`);
+        }
+      });
+      workers[idx] = w as unknown as any;
+      return;
+    }
+
+    // Fork child-process worker
+    const child = fork(workerScript, [], { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
+    if (DEBUG) console.log(`forked child worker ${idx} pid=${child.pid} for contract ${contractIndex}`);
+
+    child.on('message', (m: any) => {
+      if (m?.type === 'rate') {
+        perWorker[m.wid] = m.hps ?? 0;
+      } else if (m?.type === 'found') {
+        found = { nonce: BigInt(m.nonce), hashHex: m.hashHex };
+        for (const ww of workers) try { terminateWorker(ww); } catch {}
+      } else if (m?.type === 'error') {
+        console.error(`Child worker ${idx} error: ${m.message}`);
       }
     });
 
-    w.on("error", (err) => {
-      console.error(`Worker ${idx} error: ${err?.message ?? err}`);
+    child.on('error', (err) => {
+      console.error(`Child worker ${idx} process error: ${err?.message ?? err}`);
     });
 
-    w.on("exit", (code: number | null, signal: string | null) => {
-      if (DEBUG) console.debug(`Worker ${idx} exit code=${code} signal=${signal}`);
-      // Non-zero exit or signal means potential crash; attempt restart
+    child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (DEBUG) console.debug(`child ${idx} exit code=${code} signal=${signal}`);
       const crashed = (code && code !== 0) || (signal && signal !== null);
       if (crashed) {
-        const entry = {
-          ts: new Date().toISOString(),
-          contractIndex,
-          worker: idx,
-          code,
-          signal,
-        };
-        logCrash(entry);
+        logCrash({ ts: new Date().toISOString(), contractIndex, worker: idx, code, signal, mode: 'child' });
         if (restartCounts[idx] < maxRestarts) {
           restartCounts[idx]++;
-          if (DEBUG) console.debug(`Restarting worker ${idx} (attempt ${restartCounts[idx]}/${maxRestarts})`);
+          if (DEBUG) console.debug(`Restarting child ${idx} (attempt ${restartCounts[idx]}/${maxRestarts})`);
           spawnWorker(idx);
         } else {
-          console.error(`Worker ${idx} exceeded max restarts (${maxRestarts}); not restarting.`);
+          console.error(`Child worker ${idx} exceeded max restarts (${maxRestarts}); not restarting.`);
         }
       }
     });
 
-    workers[idx] = w;
+    // send initial payload (Buffers will be serialized over IPC)
+    child.send({
+      seed: seedBuf,
+      header: headerBuf,
+      minerCanon: minerBuf,
+      target: targetBuf,
+      best: bestBuf,
+      batch: baseBatch,
+      wid: idx,
+    });
+
+    workers[idx] = child as unknown as any;
   }
 
   for (let i = 0; i < nWorkers; i++) spawnWorker(i);
