@@ -1141,6 +1141,14 @@ async function main() {
       } catch {}
     }, 1000);
 
+    // Render HUD immediately so the user sees output right away (no 1s wait)
+    try {
+      renderGlobalHUD();
+      if (DEBUG) console.debug("Initial HUD render complete");
+    } catch (e) {
+      if (DEBUG) console.debug("Initial HUD render failed:", (e as any)?.message || e);
+    }
+
     // Start mining concurrently for all selected contracts with allocated threads.
     const miners = CONTRACTS.map((contract, idx) =>
       mineOneContract(
