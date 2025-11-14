@@ -83,29 +83,23 @@ const BEST_POLL_MS = Number("5000");
 
 let logoShown = false;
 
-let HUD_LINES = 0;
+// Simpler, stable HUD renderer: clear-and-redraw each render to keep boxes
+// anchored and avoid accidental terminal scrolling caused by stray logs.
 function renderHUD(lines: any[]) {
-  if (!logoShown) {
+  try {
     console.clear();
     process.stdout.write(ASTATINE_ASCII);
     logoShown = true;
-  }
 
-  if (HUD_LINES > 0) {
-    process.stdout.write(`\x1b[${HUD_LINES}A`);
-  }
-
-  const maxLines = Math.max(HUD_LINES, lines.length);
-
-  for (let i = 0; i < maxLines; i++) {
-    process.stdout.write("\x1b[2K");
-    if (i < lines.length) {
-      process.stdout.write(String(lines[i]));
+    for (let i = 0; i < lines.length; i++) {
+      process.stdout.write(String(lines[i]) + "\n");
     }
-    process.stdout.write("\n");
+  } catch (e) {
+    // Don't allow HUD rendering problems to crash the process
+    try {
+      console.error("HUD render error:", (e as any)?.message || e);
+    } catch {}
   }
-
-  HUD_LINES = lines.length;
 }
 
 type WorkResp = {
@@ -200,13 +194,26 @@ function renderGlobalHUD() {
   const keys = Object.keys(GLOBAL_HUD).map((k) => Number(k)).sort((a, b) => a - b);
   if (keys.length === 0) return;
 
+  if (process.env.VERBOSE === "1") {
+    try {
+      const snapshotKeys = keys.slice();
+      console.debug(`GLOBAL_HUD keys: ${snapshotKeys.join(",")}`);
+      for (const k of snapshotKeys) {
+        const block = GLOBAL_HUD[k] || [];
+        console.debug(`HUD[${k}] preview:\n${block.slice(0, 6).join("\n")}`);
+      }
+    } catch (e) {
+      console.debug("GLOBAL_HUD diagnostic failed", (e as any)?.message || e);
+    }
+  }
+
   // Build blocks and compute layout
   const blocks: string[][] = keys.map((k) => GLOBAL_HUD[k] || []);
 
   const termWidth = (process.stdout && process.stdout.columns) || 80;
-  const cols = termWidth >= 160 ? 3 : termWidth >= 100 ? 2 : 1;
-  const gap = 2;
-  const blockWidth = Math.max(20, Math.floor(termWidth / cols) - gap);
+  const cols = termWidth >= 160 ? 3 : termWidth >= 120 ? 2 : 1;
+  const gap = 3; // spaces between columns
+  const blockWidth = Math.max(30, Math.floor((termWidth - gap * (cols - 1)) / cols));
 
   // Normalize blocks: limit worker lines so blocks have comparable heights
   const MAX_WORKER_LINES = 6;
@@ -228,26 +235,55 @@ function renderGlobalHUD() {
   const padded = normalized.map((b) => {
     const out = b.slice();
     while (out.length < maxHeight) out.push("");
-    return out.map((line) => line.padEnd(blockWidth).slice(0, blockWidth));
+    return out.map((line) => {
+      // truncate visible length to blockWidth-4 (for box padding)
+      const visible = line.replace(/\x1b\[[0-9;]*m/g, "");
+      const truncated = visible.length > blockWidth - 4 ? visible.slice(0, blockWidth - 7) + '...' : visible;
+      return truncated.padEnd(blockWidth - 4).slice(0, blockWidth - 4);
+    });
   });
 
   // Arrange into rows of `cols` blocks
   const rows: string[] = [];
+  // Render blocks into boxed columns
   for (let r = 0; r < Math.ceil(padded.length / cols); r++) {
-    for (let lineIdx = 0; lineIdx < maxHeight; lineIdx++) {
+    const rowBlocks: string[][] = [];
+    for (let c = 0; c < cols; c++) {
+      const idx = r * cols + c;
+      if (idx < padded.length) {
+        const content = padded[idx] ?? [];
+        const box: string[] = [];
+        const innerW = blockWidth - 4; // account for box borders
+        // header line (first line) centered
+        const header = content[0] ?? "";
+        const centered = header.length >= innerW ? header.slice(0, innerW) : header.padStart(Math.floor((innerW + header.length) / 2)).padEnd(innerW);
+        box.push('┌' + '─'.repeat(innerW + 2) + '┐');
+        box.push('│ ' + centered + ' │');
+        box.push('│' + ' '.repeat(innerW + 2) + '│');
+        for (let li = 1; li < (content.length || 0); li++) {
+          const line = content[li] ?? "";
+          box.push('│ ' + line.padEnd(innerW) + ' │');
+        }
+        box.push('└' + '─'.repeat(innerW + 2) + '┘');
+        rowBlocks.push(box);
+      } else {
+        // empty block
+        const innerW = blockWidth - 4;
+        rowBlocks.push(['┌' + '─'.repeat(innerW + 2) + '┐', '│' + ' '.repeat(innerW + 2) + '│', '└' + '─'.repeat(innerW + 2) + '┘']);
+      }
+    }
+
+    // compute max height for this row of boxes
+    const h = Math.max(...rowBlocks.map((b) => b.length));
+    for (let lineIdx = 0; lineIdx < h; lineIdx++) {
       const parts: string[] = [];
       for (let c = 0; c < cols; c++) {
-        const idx = r * cols + c;
-        if (idx < padded.length) {
-          parts.push(padded[idx]?.[lineIdx] ?? "".padEnd(blockWidth));
-        } else {
-          parts.push("".padEnd(blockWidth));
-        }
+        const blk = rowBlocks[c] || [];
+        parts.push((blk[lineIdx] ?? ' '.repeat(blockWidth)).padEnd(blockWidth));
       }
-      rows.push(parts.join(" ".repeat(gap)));
+      rows.push(parts.join(' '.repeat(gap)));
     }
-    // add spacing row between block rows
-    rows.push("");
+    rows.push('');
   }
 
   renderHUD(rows);
@@ -551,8 +587,13 @@ async function mineOneContract(
         }
       }
     });
-    w.on("error", (err) => console.error(`Worker ${i} error:`, err));
-    w.on("exit", (code) => {});
+    w.on("error", (err) => {
+      if (process.env.VERBOSE === "1") console.error(`Worker ${i} error:`, err);
+      else console.error(`Worker ${i} error: ${err?.message ?? err}`);
+    });
+    w.on("exit", (code: number | null, signal: string | null) => {
+      if (process.env.VERBOSE === "1") console.debug(`Worker ${i} exit code=${code} signal=${signal}`);
+    });
     workers.push(w);
   }
 
@@ -616,6 +657,9 @@ async function mineOneContract(
     }
 
     if (Date.now() - lastHud >= 1000) {
+      if (process.env.VERBOSE === "1") {
+        console.debug(`Starting HUD publish for contractIndex=${contractIndex} threads=${nWorkers}`);
+      }
       const totalHps = perWorker.reduce((a, b) => a + (b ?? 0), 0);
       const astatineTitle =
         `${C.g("Astatine Miner")}  ` +
