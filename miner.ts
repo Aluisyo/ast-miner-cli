@@ -128,6 +128,43 @@ const C = {
   b: (s: string) => `\x1b[34m${s}\x1b[0m`,
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
 };
+// ANSI helpers: measure and slice while preserving color codes
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+function stripAnsi(s: string) {
+  return s.replace(ANSI_RE, "");
+}
+function visibleLength(s: string) {
+  return stripAnsi(s).length;
+}
+function ansiTruncate(s: string, maxVisible: number) {
+  if (visibleLength(s) <= maxVisible) return s;
+  let out = "";
+  let remaining = maxVisible;
+  const re = /(\x1b\[[0-9;]*m)|([\s\S])/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(s)) !== null && remaining > 0) {
+    if (match[1]) {
+      out += match[1];
+      continue;
+    }
+    const ch = match[2];
+    out += ch;
+    remaining--;
+  }
+  // append ellipsis in plain text (no color)
+  return out + "...";
+}
+function ansiPadEnd(s: string, width: number) {
+  const pad = Math.max(0, width - visibleLength(s));
+  return s + " ".repeat(pad);
+}
+function ansiCenter(s: string, width: number) {
+  const vis = visibleLength(s);
+  if (vis >= width) return ansiTruncate(s, width);
+  const left = Math.floor((width - vis) / 2);
+  const right = width - vis - left;
+  return " ".repeat(left) + s + " ".repeat(right);
+}
 function hudLine(s: string) {
   process.stdout.clearLine(0);
   process.stdout.cursorTo(0);
@@ -135,7 +172,9 @@ function hudLine(s: string) {
 }
 function bar(pct: number, width = 24) {
   const full = Math.round(pct * width);
-  return "▮".repeat(full) + "▯".repeat(width - full);
+  const fullPart = "▮".repeat(full);
+  const emptyPart = "▯".repeat(width - full);
+  return C.g(fullPart) + C.dim(emptyPart);
 }
 function sleep(ms: number) {
   return new Promise((res) => setTimeout(res, ms));
@@ -235,11 +274,11 @@ function renderGlobalHUD() {
   const padded = normalized.map((b) => {
     const out = b.slice();
     while (out.length < maxHeight) out.push("");
+    const innerW = blockWidth - 4;
     return out.map((line) => {
-      // truncate visible length to blockWidth-4 (for box padding)
-      const visible = line.replace(/\x1b\[[0-9;]*m/g, "");
-      const truncated = visible.length > blockWidth - 4 ? visible.slice(0, blockWidth - 7) + '...' : visible;
-      return truncated.padEnd(blockWidth - 4).slice(0, blockWidth - 4);
+      // truncate/pad preserving ANSI colors
+      const truncated = visibleLength(line) > innerW ? ansiTruncate(line, innerW - 3) : line;
+      return ansiPadEnd(truncated, innerW).slice(0, innerW);
     });
   });
 
@@ -254,22 +293,26 @@ function renderGlobalHUD() {
         const content = padded[idx] ?? [];
         const box: string[] = [];
         const innerW = blockWidth - 4; // account for box borders
-        // header line (first line) centered
+        // header line (first line) centered (preserve ANSI)
         const header = content[0] ?? "";
-        const centered = header.length >= innerW ? header.slice(0, innerW) : header.padStart(Math.floor((innerW + header.length) / 2)).padEnd(innerW);
-        box.push('┌' + '─'.repeat(innerW + 2) + '┐');
-        box.push('│ ' + centered + ' │');
-        box.push('│' + ' '.repeat(innerW + 2) + '│');
+        const centered = ansiCenter(header, innerW);
+        box.push(C.dim('┌' + '─'.repeat(innerW + 2) + '┐'));
+        box.push(C.dim('│ ') + centered + C.dim(' │'));
+        box.push(C.dim('│') + ' '.repeat(innerW + 2) + C.dim('│'));
         for (let li = 1; li < (content.length || 0); li++) {
           const line = content[li] ?? "";
-          box.push('│ ' + line.padEnd(innerW) + ' │');
+          box.push(C.dim('│ ') + ansiPadEnd(line, innerW) + C.dim(' │'));
         }
-        box.push('└' + '─'.repeat(innerW + 2) + '┘');
+        box.push(C.dim('└' + '─'.repeat(innerW + 2) + '┘'));
         rowBlocks.push(box);
       } else {
         // empty block
         const innerW = blockWidth - 4;
-        rowBlocks.push(['┌' + '─'.repeat(innerW + 2) + '┐', '│' + ' '.repeat(innerW + 2) + '│', '└' + '─'.repeat(innerW + 2) + '┘']);
+        rowBlocks.push([
+          C.dim('┌' + '─'.repeat(innerW + 2) + '┐'),
+          C.dim('│' + ' '.repeat(innerW + 2) + '│'),
+          C.dim('└' + '─'.repeat(innerW + 2) + '┘'),
+        ]);
       }
     }
 
