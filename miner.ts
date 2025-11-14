@@ -2,6 +2,9 @@ import * as readline from "readline";
 import * as os from "os";
 import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
 import { fork, ChildProcess } from "child_process";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const stringWidth = require("string-width");
 import { randomBytes, createHash } from "crypto";
 import * as bech32 from "bech32";
 import * as fs from "fs";
@@ -193,25 +196,41 @@ function stripAnsi(s: string) {
   return s.replace(ANSI_RE, "");
 }
 function visibleLength(s: string) {
-  return stripAnsi(s).length;
+  try {
+    return Number(stringWidth(stripAnsi(s)) || 0);
+  } catch {
+    return stripAnsi(s).length;
+  }
 }
 function ansiTruncate(s: string, maxVisible: number) {
+  // Reserve 3 columns for ellipsis when truncating
+  const ELLIPSIS = "...";
+  const reserve = 3;
   if (visibleLength(s) <= maxVisible) return s;
-  let out = "";
-  let remaining = maxVisible;
+  const allowed = Math.max(0, maxVisible - reserve);
+  if (allowed <= 0) return ELLIPSIS.slice(0, maxVisible);
+
   const re = /(\x1b\[[0-9;]*m)|([\s\S])/g;
+  let out = "";
+  let remaining = allowed;
   let match: RegExpExecArray | null;
   while ((match = re.exec(s)) !== null && remaining > 0) {
     if (match[1]) {
+      // ANSI sequence, keep it
       out += match[1];
       continue;
     }
     const ch = match[2];
-    out += ch;
-    remaining--;
+    const w = Number(stringWidth(ch) || 0);
+    if (w <= remaining) {
+      out += ch;
+      remaining -= w;
+    } else {
+      break;
+    }
   }
-  // append ellipsis in plain text (no color)
-  return out + "...";
+  // close any open ANSI sequences? We rely on the terminal to reset color at end
+  return out + ELLIPSIS;
 }
 function ansiPadEnd(s: string, width: number) {
   const pad = Math.max(0, width - visibleLength(s));
