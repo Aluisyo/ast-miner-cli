@@ -4,6 +4,7 @@ import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
 import { randomBytes, createHash } from "crypto";
 import * as bech32 from "bech32";
 import * as fs from "fs";
+import * as path from "path";
 import { fromBase64 } from "@cosmjs/encoding";
 import {
   ChainGrpcBankApi,
@@ -16,6 +17,8 @@ import {
 import { Network, getNetworkEndpoints } from "@injectivelabs/networks";
 import dotenv from "dotenv";
 dotenv.config({ quiet: true });
+
+const DEBUG = process.env.DEBUG === "1";
 
 const ASTATINE_ASCII = `
 \x1b[32m
@@ -57,6 +60,61 @@ const ENDPOINTS = getNetworkEndpoints(
 const GRPC = ENDPOINTS.grpc;
 const NETWORK_ENUM = NETWORK === "mainnet" ? Network.Mainnet : Network.Testnet;
 const AST_DENOM = process.env.AST_NATIVE_DENOM || "factory/inj1k9hde84nufwmzq0wf6xs4jysll60fy6hd72ws2/AST";
+const AST_DECIMALS = Number(process.env.AST_DECIMALS || "18");
+let DETECTED_AST_DECIMALS: number | null = null;
+
+async function detectAstDecimals() {
+  // Try multiple strategies to detect decimals:
+  // 1) If AST_DENOM starts with 'factory/{creator}/{sub}', attempt to query
+  //    the creator address as a CW20 contract for `token_info`.
+  // 2) Try bank metadata if available on the bank API.
+  try {
+    if (AST_DENOM.startsWith("factory/")) {
+      const parts = AST_DENOM.split("/");
+      if (parts.length >= 3 && parts[1]) {
+        const creator = parts[1] as string;
+        // Try common CW20 `token_info` query
+        try {
+          const raw = await wasmApi.fetchSmartContractState(
+            creator as string,
+            toBase64({ token_info: {} })
+          );
+          const info = JSON.parse(Buffer.from(raw.data).toString());
+          if (info && typeof info.decimals === "number") {
+            DETECTED_AST_DECIMALS = info.decimals;
+            if (DEBUG) console.debug(`Detected AST decimals from token_info: ${DETECTED_AST_DECIMALS}`);
+            return;
+          }
+        } catch (e) {
+          if (DEBUG) console.debug("token_info query failed", (e as any)?.message || e);
+        }
+      }
+    }
+
+    // Try bank denom metadata if available
+    try {
+      const anyBank: any = bankApi as any;
+      if (typeof anyBank.fetchDenomMetadata === "function") {
+        const meta = await anyBank.fetchDenomMetadata({ denom: AST_DENOM });
+        if (meta && meta.metadata && typeof meta.metadata.denom_units === "object") {
+          const units = meta.metadata.denom_units;
+          // find exponent for denom that has denom equal to AST_DENOM or base denom
+          if (Array.isArray(units) && units.length > 0) {
+            // choose smallest exponent as decimals
+            let best = units.reduce((acc: any, u: any) => (u.exponent > acc ? u.exponent : acc), 0);
+            DETECTED_AST_DECIMALS = Number(best) || AST_DECIMALS;
+            if (DEBUG) console.debug(`Detected AST decimals from bank metadata: ${DETECTED_AST_DECIMALS}`);
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      if (DEBUG) console.debug("denom metadata query failed", (e as any)?.message || e);
+    }
+  } catch (e) {
+    if (DEBUG) console.debug("detectAstDecimals unexpected error", (e as any)?.message || e);
+  }
+}
 const SELECTED_NODE = process.env.VALIDATOR_NO || "1";
 
 // Support comma-separated validator indices (e.g. "1,2,3")
@@ -233,7 +291,7 @@ function renderGlobalHUD() {
   const keys = Object.keys(GLOBAL_HUD).map((k) => Number(k)).sort((a, b) => a - b);
   if (keys.length === 0) return;
 
-  if (process.env.VERBOSE === "1") {
+  if (DEBUG) {
     try {
       const snapshotKeys = keys.slice();
       console.debug(`GLOBAL_HUD keys: ${snapshotKeys.join(",")}`);
@@ -346,9 +404,35 @@ async function getAstBalance(address: string): Promise<string> {
       denom: AST_DENOM,
     });
 
+    if (process.env.VERBOSE === "1") {
+      try {
+        console.debug(`getAstBalance: denom=${AST_DENOM} ->`, JSON.stringify(res));
+      } catch {}
+    }
+
     return res.amount || "0";
   } catch {}
   return "0";
+}
+
+// Format a base-unit token amount (string) into a human readable string using
+// provided decimals. Returns something like `1.2345` and we also expose raw units
+function formatTokenBase(amountBase: string, decimals: number, fracDigits = 4) {
+  try {
+    const base = BigInt(amountBase || "0");
+    const ten = 10n;
+    const d = BigInt(decimals);
+    const whole = base / ten ** d;
+    const rem = base % ten ** d;
+    if (fracDigits <= 0) return `${whole.toString()}`;
+    // get fractional as string padded to `decimals` then cut to fracDigits
+    const remStr = rem.toString().padStart(Number(d), "0");
+    const frac = remStr.slice(0, Math.min(Number(d), fracDigits));
+    const fracPadded = frac.padEnd(fracDigits, "0");
+    return `${whole.toString()}.${fracPadded}`;
+  } catch (e) {
+    return "0";
+  }
 }
 async function qWork(contract: string): Promise<WorkResp> {
   const raw = await wasmApi.fetchSmartContractState(
@@ -445,8 +529,9 @@ type WorkerOut =
   | { type: "found"; nonce: string; hashHex: string; wid: number };
 
 if (!isMainThread) {
-  const { seed, header, minerCanon, target, best, batch, wid } =
-    workerData as WorkerIn;
+  try {
+    const { seed, header, minerCanon, target, best, batch, wid } =
+      workerData as WorkerIn;
 
   const sU8 = seed instanceof Uint8Array ? seed : new Uint8Array(seed as any);
   const hU8 =
@@ -463,28 +548,27 @@ if (!isMainThread) {
       : new Uint8Array(best as any)
     : null;
 
-  const seedBuf = Buffer.from(sU8.buffer, sU8.byteOffset, sU8.byteLength);
-  const headerBuf = Buffer.from(hU8.buffer, hU8.byteOffset, hU8.byteLength);
-  const minerBuf = Buffer.from(mU8.buffer, mU8.byteOffset, mU8.byteLength);
-  const targetBuf = Buffer.from(tU8.buffer, tU8.byteOffset, tU8.byteLength);
-  let bestBuf: Buffer | null = bU8
-    ? Buffer.from(bU8.buffer, bU8.byteOffset, bU8.byteLength)
-    : null;
+  // Copy the incoming Uint8Array into fresh Buffers to avoid sharing
+  const seedBuf = Buffer.from(sU8);
+  const headerBuf = Buffer.from(hU8);
+  const minerBuf = Buffer.from(mU8);
+  const targetBuf = Buffer.from(tU8);
+  let bestBuf: Buffer | null = bU8 ? Buffer.from(bU8) : null;
 
-  parentPort!.on("message", (msg: any) => {
-    if (msg?.type === "best") {
-      const bestHex: string | null = msg.bestHex ?? null;
-      if (bestHex) {
-        const s = bestHex.length % 2 ? "0" + bestHex : bestHex;
-        const raw = Buffer.from(s, "hex");
-        const out = Buffer.alloc(32);
-        raw.copy(out, 32 - raw.length);
-        bestBuf = out;
-      } else {
-        bestBuf = null;
+    parentPort!.on("message", (msg: any) => {
+      if (msg?.type === "best") {
+        const bestHex: string | null = msg.bestHex ?? null;
+        if (bestHex) {
+          const s = bestHex.length % 2 ? "0" + bestHex : bestHex;
+          const raw = Buffer.from(s, "hex");
+          const out = Buffer.alloc(32);
+          raw.copy(out, 32 - raw.length);
+          bestBuf = out;
+        } else {
+          bestBuf = null;
+        }
       }
-    }
-  });
+    });
 
   const { pre, nonceOffset } = buildPreimageStatic(
     seedBuf,
@@ -498,7 +582,7 @@ if (!isMainThread) {
   let attempts = 0;
   let last = Date.now();
 
-  for (;;) {
+    for (;;) {
     for (let i = 0; i < BATCH; i++) {
       inc128BE(nonceB);
       nonceB.copy(pre, nonceOffset);
@@ -515,7 +599,13 @@ if (!isMainThread) {
           hashHex: h2.toString("hex"),
           wid,
         });
-        process.exit(0);
+        // gracefully close the worker
+        try {
+          parentPort!.close();
+        } catch {}
+        try {
+          process.exit(0);
+        } catch {}
       }
     }
     const now = Date.now();
@@ -524,8 +614,16 @@ if (!isMainThread) {
       attempts = 0;
       last = now;
     }
+    }
+    } catch (e) {
+      try {
+        parentPort?.postMessage({ type: "error", message: (e as any)?.message || String(e) });
+      } catch {}
+      try {
+        process.exit(1);
+      } catch {}
+    }
   }
-}
 
 
 async function mineOneContract(
@@ -578,67 +676,89 @@ async function mineOneContract(
   let finalizeTx: string | undefined;
   let submitTx: string | undefined;
 
-  for (let i = 0; i < nWorkers; i++) {
-    // Prefer compiled worker if available (built via `npm run build`).
-    const compiledWorkerPath = new URL("./dist/miner.js", import.meta.url);
-    const useCompiled = fs.existsSync(compiledWorkerPath);
+  // Supervisor: spawn workers with restart logic and crash logging
+  const compiledWorkerPath = new URL("./dist/miner.js", import.meta.url);
+  const useCompiled = fs.existsSync(compiledWorkerPath);
+  const restartCounts = new Array(nWorkers).fill(0);
+  const maxRestarts = Number(process.env.WORKER_MAX_RESTARTS || "3");
+  const crashLogPath = path.join(process.cwd(), "logs", "worker_crashes.log");
+  try {
+    fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+  } catch {}
+
+  function logCrash(entry: Record<string, any>) {
+    try {
+      fs.appendFileSync(crashLogPath, JSON.stringify(entry) + "\n");
+    } catch {}
+  }
+
+  function spawnWorker(idx: number) {
+    const payload = {
+      seed: Uint8Array.from(seedBuf),
+      header: Uint8Array.from(headerBuf),
+      minerCanon: Uint8Array.from(minerBuf),
+      target: Uint8Array.from(targetBuf),
+      best: bestBuf ? Uint8Array.from(bestBuf) : null,
+      batch: baseBatch,
+      wid: idx,
+    } as unknown as WorkerIn;
 
     const w = useCompiled
-      ? new Worker(compiledWorkerPath, {
-          workerData: {
-            seed: seedBuf,
-            header: headerBuf,
-            minerCanon: minerBuf,
-            target: targetBuf,
-            best: bestBuf,
-            batch: baseBatch,
-            wid: i,
-          } as WorkerIn,
-        })
+      ? new Worker(compiledWorkerPath, { workerData: payload })
       : new Worker(new URL(import.meta.url), {
           execArgv: ["--loader", "ts-node/esm", "--no-warnings"],
-          workerData: {
-            seed: seedBuf,
-            header: headerBuf,
-            minerCanon: minerBuf,
-            target: targetBuf,
-            best: bestBuf,
-            batch: baseBatch,
-            wid: i,
-          } as WorkerIn,
+          workerData: payload,
         });
-    if (process.env.VERBOSE === "1") {
-      console.log(`spawned worker ${i} for contract ${contractIndex} (threads=${nWorkers})`);
-    }
-    w.on("message", (m: WorkerOut) => {
-      // Only print worker debug when VERBOSE=1 to avoid HUD noise
-      if (process.env.VERBOSE === "1") {
-        if (m.type === "rate") {
-          console.debug(`contract ${contractIndex} worker ${m.wid} -> rate ${m.hps} H/s`);
-        } else if (m.type === "found") {
-          console.debug(`contract ${contractIndex} worker ${m.wid} -> found nonce ${m.nonce}`);
-        }
-      }
-      if (m.type === "rate") {
+
+    if (DEBUG) console.log(`spawned worker ${idx} for contract ${contractIndex} (threads=${nWorkers})`);
+
+    w.on("message", (m: any) => {
+      if (m?.type === "rate") {
         perWorker[m.wid] = m.hps ?? 0;
-      } else if (m.type === "found") {
+        if (DEBUG) console.debug(`contract ${contractIndex} worker ${m.wid} -> rate ${m.hps} H/s`);
+      } else if (m?.type === "found") {
         found = { nonce: BigInt(m.nonce), hashHex: m.hashHex };
         for (const ww of workers) {
           try {
             ww.terminate();
           } catch {}
         }
+      } else if (m?.type === "error") {
+        console.error(`Worker ${idx} reported error: ${m.message}`);
       }
     });
+
     w.on("error", (err) => {
-      if (process.env.VERBOSE === "1") console.error(`Worker ${i} error:`, err);
-      else console.error(`Worker ${i} error: ${err?.message ?? err}`);
+      console.error(`Worker ${idx} error: ${err?.message ?? err}`);
     });
+
     w.on("exit", (code: number | null, signal: string | null) => {
-      if (process.env.VERBOSE === "1") console.debug(`Worker ${i} exit code=${code} signal=${signal}`);
+      if (DEBUG) console.debug(`Worker ${idx} exit code=${code} signal=${signal}`);
+      // Non-zero exit or signal means potential crash; attempt restart
+      const crashed = (code && code !== 0) || (signal && signal !== null);
+      if (crashed) {
+        const entry = {
+          ts: new Date().toISOString(),
+          contractIndex,
+          worker: idx,
+          code,
+          signal,
+        };
+        logCrash(entry);
+        if (restartCounts[idx] < maxRestarts) {
+          restartCounts[idx]++;
+          if (DEBUG) console.debug(`Restarting worker ${idx} (attempt ${restartCounts[idx]}/${maxRestarts})`);
+          spawnWorker(idx);
+        } else {
+          console.error(`Worker ${idx} exceeded max restarts (${maxRestarts}); not restarting.`);
+        }
+      }
     });
-    workers.push(w);
+
+    workers[idx] = w;
   }
+
+  for (let i = 0; i < nWorkers; i++) spawnWorker(i);
 
   let lastHud = Date.now();
   let lastBestPoll = 0;
@@ -712,8 +832,11 @@ async function mineOneContract(
             address.slice(address.length - 5, address.length - 1)
         )}  `;
 
+      // Format AST using AST_DECIMALS (default 18). Show human + raw units.
+      const astHuman = formatTokenBase(astBal || "0", AST_DECIMALS, 4);
+      const astRaw = astBal || "0";
       const balances =
-        `AST Balance ${C.b(String((Number(astBal) / 10 ** 18).toFixed(2)))}  ` +
+        `AST Balance ${C.b(astHuman)} ${C.dim(`(${astRaw} base)`) }  ` +
         `INJ Balance ${C.y(String((Number(injBal) / 10 ** 18).toFixed(2)))}  `;
       const headerLine =
         `${C.c(`H/s ${totalHps.toLocaleString()}`)}  ` +
