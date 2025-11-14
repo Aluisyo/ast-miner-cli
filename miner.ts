@@ -3,6 +3,7 @@ import * as os from "os";
 import { Worker, isMainThread, parentPort, workerData } from "worker_threads";
 import { randomBytes, createHash } from "crypto";
 import * as bech32 from "bech32";
+import * as fs from "fs";
 import { fromBase64 } from "@cosmjs/encoding";
 import {
   ChainGrpcBankApi,
@@ -36,20 +37,43 @@ const ascii = `
 \x1b[0m
 `;
 
-const nodes = [
+// Default contract addresses (can be overridden by `CONTRACT_ADDRESSES` env var)
+const DEFAULT_NODES = [
   "inj1qfd8vwq0j4ps2mn0felam8f4u8a5xvxn39ezfy",
   "inj1wgvjaat3gna8dvuz7vqv6jmveng8kftlxklxjr",
   "inj1h9uwgtd9dfcgfzvr870ge0cxq3erqrvzd2r5fz",
 ];
+
+const envNodes = process.env.CONTRACT_ADDRESSES
+  ? process.env.CONTRACT_ADDRESSES.split(",").map((s) => s.trim()).filter(Boolean)
+  : null;
+
+const nodes = envNodes && envNodes.length > 0 ? envNodes : DEFAULT_NODES;
 
 const NETWORK = (process.env.NETWORK || "testnet") as "mainnet" | "testnet";
 const ENDPOINTS = getNetworkEndpoints(
   NETWORK === "mainnet" ? Network.Mainnet : Network.Testnet
 );
 const GRPC = ENDPOINTS.grpc;
-const SELECTED_NODE = process.env.VALIDATOR_NO;
+const NETWORK_ENUM = NETWORK === "mainnet" ? Network.Mainnet : Network.Testnet;
+const AST_DENOM = process.env.AST_NATIVE_DENOM || "factory/inj1k9hde84nufwmzq0wf6xs4jysll60fy6hd72ws2/AST";
+const SELECTED_NODE = process.env.VALIDATOR_NO || "1";
 
-const CONTRACT = nodes[Number(SELECTED_NODE) - 1];
+// Support comma-separated validator indices (e.g. "1,2,3")
+const SELECTED_NODES = SELECTED_NODE.split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+
+// Resolve to an array of contract addresses to mine (type-guarded to `string[]`)
+const CONTRACTS = SELECTED_NODES.map((n) => nodes[n - 1]).filter(
+  (c): c is string => Boolean(c)
+);
+
+// Validate mapping and log what we'll mine
+if (CONTRACTS.length === 0) {
+  console.error("No contract addresses resolved for selected validator indices. Check VALIDATOR_NO and CONTRACT_ADDRESSES.");
+}
+for (let i = 0; i < CONTRACTS.length; i++) {
+  console.log(`Contract[${i}]: ${CONTRACTS[i]}`);
+}
 
 const SUBMIT_FEE_INJ = Number(process.env.SUBMIT_FEE_INJ || "0.01");
 const GAS_LIMIT = Number(process.env.GAS_LIMIT || "400000");
@@ -164,6 +188,71 @@ function inc128BE(buf: Buffer) {
 const bankApi = new ChainGrpcBankApi(GRPC);
 const wasmApi = new ChainGrpcWasmApi(GRPC);
 
+// Global HUD state for multiple contracts. Each contract reports its own lines here
+const GLOBAL_HUD: Record<number, string[]> = {};
+function setContractHud(idx: number, lines: string[]) {
+  GLOBAL_HUD[idx] = lines;
+}
+function clearContractHud(idx: number) {
+  delete GLOBAL_HUD[idx];
+}
+function renderGlobalHUD() {
+  const keys = Object.keys(GLOBAL_HUD).map((k) => Number(k)).sort((a, b) => a - b);
+  if (keys.length === 0) return;
+
+  // Build blocks and compute layout
+  const blocks: string[][] = keys.map((k) => GLOBAL_HUD[k] || []);
+
+  const termWidth = (process.stdout && process.stdout.columns) || 80;
+  const cols = termWidth >= 160 ? 3 : termWidth >= 100 ? 2 : 1;
+  const gap = 2;
+  const blockWidth = Math.max(20, Math.floor(termWidth / cols) - gap);
+
+  // Normalize blocks: limit worker lines so blocks have comparable heights
+  const MAX_WORKER_LINES = 6;
+  const normalized: string[][] = blocks.map((b) => {
+    // If block contains many worker lines at the end, truncate them
+    if (b.length > 12) {
+      const head = b.slice(0, 10);
+      const tailCount = b.length - 10;
+      head.push(`... and ${tailCount} more lines ...`);
+      return head;
+    }
+    return b.slice();
+  });
+
+  const blockHeights = normalized.map((b) => b.length);
+  const maxHeight = Math.min(25, Math.max(...blockHeights));
+
+  // Pad blocks to maxHeight with empty strings
+  const padded = normalized.map((b) => {
+    const out = b.slice();
+    while (out.length < maxHeight) out.push("");
+    return out.map((line) => line.padEnd(blockWidth).slice(0, blockWidth));
+  });
+
+  // Arrange into rows of `cols` blocks
+  const rows: string[] = [];
+  for (let r = 0; r < Math.ceil(padded.length / cols); r++) {
+    for (let lineIdx = 0; lineIdx < maxHeight; lineIdx++) {
+      const parts: string[] = [];
+      for (let c = 0; c < cols; c++) {
+        const idx = r * cols + c;
+        if (idx < padded.length) {
+          parts.push(padded[idx]?.[lineIdx] ?? "".padEnd(blockWidth));
+        } else {
+          parts.push("".padEnd(blockWidth));
+        }
+      }
+      rows.push(parts.join(" ".repeat(gap)));
+    }
+    // add spacing row between block rows
+    rows.push("");
+  }
+
+  renderHUD(rows);
+}
+
 async function getInjBalance(address: string): Promise<bigint> {
   const res = await bankApi.fetchBalance({
     accountAddress: address,
@@ -175,7 +264,7 @@ async function getAstBalance(address: string): Promise<string> {
   try {
     const res = await bankApi.fetchBalance({
       accountAddress: address,
-      denom: "factory/inj1k9hde84nufwmzq0wf6xs4jysll60fy6hd72ws2/AST",
+      denom: AST_DENOM,
     });
 
     return res.amount || "0";
@@ -210,7 +299,7 @@ async function submitSolution(
   const pk = pkFromMnemonic(mnemonic, HDPATH_DEFAULT);
   const broadcaster = new MsgBroadcasterWithPk({
     privateKey: pk.toPrivateKeyHex(),
-    network: Network.Testnet,
+    network: NETWORK_ENUM,
   });
   const funds = [{ denom: "inj", amount: injToWeiStr(SUBMIT_FEE_INJ) }];
   const msg = MsgExecuteContractCompat.fromJSON({
@@ -233,7 +322,7 @@ async function finalizeWindow(
   const pk = pkFromMnemonic(mnemonic, HDPATH_DEFAULT);
   const broadcaster = new MsgBroadcasterWithPk({
     privateKey: pk.toPrivateKeyHex(),
-    network: Network.Testnet,
+    network: NETWORK_ENUM,
   });
   const msg = MsgExecuteContractCompat.fromJSON({
     contractAddress: contract,
@@ -359,9 +448,6 @@ if (!isMainThread) {
   }
 }
 
-let best_addr: string | undefined;
-let finalizeTx: string | undefined;
-let submitTx: string | undefined;
 
 async function mineOneContract(
   mnemonic: string,
@@ -369,7 +455,8 @@ async function mineOneContract(
   contract: string,
   threads: number,
   astBal: string,
-  injBal: bigint
+  injBal: bigint,
+  contractIndex: number
 ) {
   let work = await qWork(contract);
   let contest = await qContest(contract);
@@ -407,20 +494,52 @@ async function mineOneContract(
     hashHex: "none",
   };
 
+  // Per-contract state (do not share between contracts)
+  let best_addr: string | undefined;
+  let finalizeTx: string | undefined;
+  let submitTx: string | undefined;
+
   for (let i = 0; i < nWorkers; i++) {
-    const w = new Worker(new URL(import.meta.url), {
-      execArgv: ["--loader", "ts-node/esm", "--no-warnings"],
-      workerData: {
-        seed: seedBuf,
-        header: headerBuf,
-        minerCanon: minerBuf,
-        target: targetBuf,
-        best: bestBuf,
-        batch: baseBatch,
-        wid: i,
-      } as WorkerIn,
-    });
+    // Prefer compiled worker if available (built via `npm run build`).
+    const compiledWorkerPath = new URL("./dist/miner.js", import.meta.url);
+    const useCompiled = fs.existsSync(compiledWorkerPath);
+
+    const w = useCompiled
+      ? new Worker(compiledWorkerPath, {
+          workerData: {
+            seed: seedBuf,
+            header: headerBuf,
+            minerCanon: minerBuf,
+            target: targetBuf,
+            best: bestBuf,
+            batch: baseBatch,
+            wid: i,
+          } as WorkerIn,
+        })
+      : new Worker(new URL(import.meta.url), {
+          execArgv: ["--loader", "ts-node/esm", "--no-warnings"],
+          workerData: {
+            seed: seedBuf,
+            header: headerBuf,
+            minerCanon: minerBuf,
+            target: targetBuf,
+            best: bestBuf,
+            batch: baseBatch,
+            wid: i,
+          } as WorkerIn,
+        });
+    if (process.env.VERBOSE === "1") {
+      console.log(`spawned worker ${i} for contract ${contractIndex} (threads=${nWorkers})`);
+    }
     w.on("message", (m: WorkerOut) => {
+      // Only print worker debug when VERBOSE=1 to avoid HUD noise
+      if (process.env.VERBOSE === "1") {
+        if (m.type === "rate") {
+          console.debug(`contract ${contractIndex} worker ${m.wid} -> rate ${m.hps} H/s`);
+        } else if (m.type === "found") {
+          console.debug(`contract ${contractIndex} worker ${m.wid} -> found nonce ${m.nonce}`);
+        }
+      }
       if (m.type === "rate") {
         perWorker[m.wid] = m.hps ?? 0;
       } else if (m.type === "found") {
@@ -461,6 +580,8 @@ async function mineOneContract(
         finalizeTx = e.message;
       }
       await sleep(FINALIZE_COOLDOWN_MS);
+      // Clear HUD for this contract before returning
+      clearContractHud(contractIndex);
       return;
     }
 
@@ -556,7 +677,9 @@ async function mineOneContract(
         );
       }
 
-      renderHUD([
+      // Publish per-contract HUD block to the global HUD renderer
+      setContractHud(contractIndex, [
+        `=== Contract ${contractIndex + 1} (${contract.slice(0, 8)}...) ===`,
         astatineTitle,
         balances,
         headerLine,
@@ -607,11 +730,12 @@ async function mineOneContract(
       }
 
       try {
+        const prevHashStr = freshWork.prev_hash as string;
         const resp = await submitSolution(
           mnemonic,
           address,
           contract,
-          freshWork.prev_hash,
+          prevHashStr,
           found.nonce
         );
         if (resp) {
@@ -649,7 +773,9 @@ async function main() {
       ? args[idxMnemonic + 1]
       : await prompt("12-word mnemonic: ");
   const hd = HDPATH_DEFAULT;
-  const threads = 0;
+  // Allow controlling threads per contract via env `MINER_THREADS_PER_CONTRACT`.
+  // If 0 (default) mineOneContract will use CPU count as before.
+  const threads = Number(process.env.MINER_THREADS_PER_CONTRACT || "0");
 
   if (!mnemonic) return;
 
@@ -664,7 +790,6 @@ async function main() {
   }
 
   while (true) {
-    logoShown = false;
     const injBal = await getInjBalance(address);
     if (injBal <= BigInt(1e16)) {
       console.clear();
@@ -676,12 +801,86 @@ async function main() {
       process.exit(1);
     }
     const astBal = await getAstBalance(address);
-    if (!CONTRACT) {
-      console.log("Contract not found");
+    if (!CONTRACTS || CONTRACTS.length === 0) {
+      console.log("Contract(s) not found");
       return;
     }
 
-    await mineOneContract(mnemonic, address, CONTRACT, threads, astBal, injBal);
+    // Determine threads allocation per contract.
+    const nContracts = CONTRACTS.length;
+    let perContractThreads: number[] = [];
+
+    if (threads > 0) {
+      // Explicit per-contract override from MINER_THREADS_PER_CONTRACT.
+      // Respect TOTAL_THREADS (or CPU count) to avoid oversubscription/crashes.
+      const totalAllowed = Number(process.env.TOTAL_THREADS || os.cpus().length) || os.cpus().length;
+      const totalRequested = threads * nContracts;
+      if (totalRequested > totalAllowed) {
+        console.warn(
+          `Requested ${totalRequested} threads (MINER_THREADS_PER_CONTRACT=${threads} × ${nContracts}) > TOTAL_THREADS ${totalAllowed}. Redistributing to avoid oversubscription.`
+        );
+        let base = Math.floor(totalAllowed / nContracts);
+        let rem = totalAllowed % nContracts;
+        if (base === 0) {
+          base = 1;
+          rem = 0;
+        }
+        for (let i = 0; i < nContracts; i++) {
+          perContractThreads.push(base + (i < rem ? 1 : 0));
+        }
+      } else {
+        perContractThreads = CONTRACTS.map(() => threads);
+      }
+    } else {
+      // Automatic division using TOTAL_THREADS or CPU count.
+      const totalThreads = Number(process.env.TOTAL_THREADS || os.cpus().length) || os.cpus().length;
+      let base = Math.floor(totalThreads / nContracts);
+      let rem = totalThreads % nContracts;
+
+      if (base === 0) {
+        // Not enough threads to give at least one to each contract.
+        // Choose to give 1 to each (may oversubscribe) but warn the user.
+        console.warn(
+          `TOTAL_THREADS (${totalThreads}) < contracts (${nContracts}); assigning 1 thread each (may oversubscribe).`
+        );
+        base = 1;
+        rem = 0;
+      }
+
+      for (let i = 0; i < nContracts; i++) {
+        perContractThreads.push(base + (i < rem ? 1 : 0));
+      }
+    }
+
+    // Log allocation
+    console.log(`Mining ${nContracts} contract(s) with threads per contract: ${perContractThreads.join(",")}`);
+
+    // Start global HUD renderer
+    const hudInterval = setInterval(() => {
+      try {
+        renderGlobalHUD();
+      } catch {}
+    }, 1000);
+
+    // Start mining concurrently for all selected contracts with allocated threads.
+    const miners = CONTRACTS.map((contract, idx) =>
+      mineOneContract(
+        mnemonic,
+        address,
+        contract,
+        perContractThreads[idx] ?? 0,
+        astBal,
+        injBal,
+        idx
+      )
+    );
+
+    // Wait for all miners to finish their current window (they return when finalizeWindow completes),
+    // then the outer loop will iterate and start them again.
+    await Promise.all(miners);
+    clearInterval(hudInterval);
+    // clear HUD after miners finish
+    renderHUD([]);
   }
 }
 
