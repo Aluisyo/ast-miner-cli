@@ -46,9 +46,9 @@ const ascii = `
 
 // Default contract addresses (can be overridden by `CONTRACT_ADDRESSES` env var)
 const DEFAULT_NODES = [
-  "inj1qfd8vwq0j4ps2mn0felam8f4u8a5xvxn39ezfy",
-  "inj1wgvjaat3gna8dvuz7vqv6jmveng8kftlxklxjr",
-  "inj1h9uwgtd9dfcgfzvr870ge0cxq3erqrvzd2r5fz",
+  "inj1khx56me446cxwg9aplqau0k5mj72yuy5t63tu3",
+  "inj1n5ah0sm3d9rrty3a96qv2v4wncs69khnu67e0n",
+  "inj1z8lz43ll5vulc58774wvncxjs2r5z0cdz046rf",
 ];
 
 const envNodes = process.env.CONTRACT_ADDRESSES
@@ -63,7 +63,7 @@ const ENDPOINTS = getNetworkEndpoints(
 );
 const GRPC = ENDPOINTS.grpc;
 const NETWORK_ENUM = NETWORK === "mainnet" ? Network.Mainnet : Network.Testnet;
-const AST_DENOM = process.env.AST_NATIVE_DENOM || "factory/inj1k9hde84nufwmzq0wf6xs4jysll60fy6hd72ws2/AST";
+const AST_DENOM = process.env.AST_NATIVE_DENOM || "factory/inj1zgym77e6mzjqceqldk4purvjnuz5jwe5ckmymg/AST";
 const AST_DECIMALS = Number(process.env.AST_DECIMALS || "18");
 let DETECTED_AST_DECIMALS: number | null = null;
 
@@ -303,6 +303,15 @@ const wasmApi = new ChainGrpcWasmApi(GRPC);
 const GLOBAL_HUD: Record<number, string[]> = {};
 function setContractHud(idx: number, lines: string[]) {
   GLOBAL_HUD[idx] = lines;
+  try {
+    // ensure logs dir exists
+    try { fs.mkdirSync(path.join(process.cwd(), 'logs'), { recursive: true }); } catch {}
+    const preview = (lines || []).slice(0, 6).map((l) => stripAnsi(String(l)).slice(0, 240));
+    const entry = { ts: new Date().toISOString(), idx, preview };
+    try { fs.appendFileSync(path.join(process.cwd(), 'logs', 'hud_updates.log'), JSON.stringify(entry) + '\n'); } catch {}
+  } catch {}
+  // Always print a short non-ANSI line so users running in a TTY see HUD activity
+  try { console.log(`HUD update -> contract ${idx}`); } catch {}
 }
 function clearContractHud(idx: number) {
   delete GLOBAL_HUD[idx];
